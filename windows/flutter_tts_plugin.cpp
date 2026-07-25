@@ -250,6 +250,7 @@ namespace {
 		static void RegisterWithRegistrar(flutter::PluginRegistrarWindows* registrar);
 		FlutterTtsPlugin();
 		virtual ~FlutterTtsPlugin();
+		void OnSpeakComplete();
 	private:
 		// Called when a method is called on this plugin's channel from Dart.
 		void HandleMethodCall(
@@ -276,6 +277,7 @@ namespace {
 		bool paused();
 		FlutterResult speakResult;
     	HANDLE addWaitHandle;
+		CRITICAL_SECTION cs;
 	};
 
 	void FlutterTtsPlugin::RegisterWithRegistrar(
@@ -294,6 +296,7 @@ namespace {
 	}
 
 	FlutterTtsPlugin::FlutterTtsPlugin() {
+		InitializeCriticalSection(&cs);
 		addWaitHandle = NULL;
 		isPaused = false;
 		speakResult = NULL;
@@ -314,18 +317,25 @@ namespace {
 	}
 
 	FlutterTtsPlugin::~FlutterTtsPlugin() {
+		if (addWaitHandle != NULL) {
+			UnregisterWaitEx(addWaitHandle, INVALID_HANDLE_VALUE);
+			addWaitHandle = NULL;
+		}
+		EnterCriticalSection(&cs);
+		if (speakResult) speakResult.reset();
+		LeaveCriticalSection(&cs);
+		if (pVoice != NULL) {
+			pVoice->Release();
+			pVoice = NULL;
+		}
+		DeleteCriticalSection(&cs);
 		::CoUninitialize();
 	}
 
-    void CALLBACK setResult(PVOID lpParam, BOOLEAN TimerOrWaitFired)
+    void CALLBACK onSpeakComplete(PVOID lpParam, BOOLEAN TimerOrWaitFired)
     {
-        flutter::MethodResult<flutter::EncodableValue>* p = (flutter::MethodResult<flutter::EncodableValue>*) lpParam;
-        p->Success(1);
-    }
-
-    void CALLBACK onCompletion(PVOID lpParam, BOOLEAN TimerOrWaitFired)
-    {
-        methodChannel->InvokeMethod("speak.onComplete", NULL);
+        FlutterTtsPlugin* plugin = static_cast<FlutterTtsPlugin*>(lpParam);
+        plugin->OnSpeakComplete();
     }
 
 	bool FlutterTtsPlugin::speaking()
@@ -339,6 +349,15 @@ namespace {
 
 
 	void FlutterTtsPlugin::speak(const std::string text, FlutterResult result) {
+		// Unregister any previous completion wait first. Without this, a stale
+		// wait callback could fire against a destroyed MethodResult (the
+		// previous speak's result), causing an access violation (0xc0000005).
+		// INVALID_HANDLE_VALUE makes UnregisterWaitEx block until any in-flight
+		// callback finishes before returning.
+		if (addWaitHandle != NULL) {
+			UnregisterWaitEx(addWaitHandle, INVALID_HANDLE_VALUE);
+			addWaitHandle = NULL;
+		}
 		HRESULT hr;
 		const std::string arg = "<PITCH MIDDLE = '" + std::to_string(int((pitch - 1) * 10 * (1 + (pitch < 1)) )) + "'/>" + text;
 
@@ -349,12 +368,34 @@ namespace {
 		delete[] wstr;
 		HANDLE speakCompletionHandle = pVoice->SpeakCompleteEvent();
 		methodChannel->InvokeMethod("speak.onStart", NULL);
-		RegisterWaitForSingleObject(&addWaitHandle, speakCompletionHandle, (WAITORTIMERCALLBACK)&onCompletion, speakResult.get(), INFINITE, WT_EXECUTEONLYONCE);
-		if (awaitSpeakCompletion){
-		    speakResult = std::move(result);
-		    RegisterWaitForSingleObject(&addWaitHandle, speakCompletionHandle, (WAITORTIMERCALLBACK)&setResult, speakResult.get(), INFINITE, WT_EXECUTEONLYONCE);
+		if (awaitSpeakCompletion) {
+			// Move the result into speakResult BEFORE registering the wait, so
+			// the callback always observes a valid pointer. Guarded by cs to
+			// avoid racing with a concurrently firing callback.
+			EnterCriticalSection(&cs);
+			speakResult = std::move(result);
+			LeaveCriticalSection(&cs);
 		}
-		else result->Success(1);
+		else {
+			result->Success(1);
+		}
+		// A single completion wait drives both speak.onComplete and resolving
+		// the awaited speak future. Using one handle avoids the previous bug of
+		// overwriting addWaitHandle with a second RegisterWaitForSingleObject
+		// call (which leaked the first registration).
+		RegisterWaitForSingleObject(&addWaitHandle, speakCompletionHandle,
+			(WAITORTIMERCALLBACK)&onSpeakComplete, this, INFINITE,
+			WT_EXECUTEONLYONCE);
+	}
+
+	void FlutterTtsPlugin::OnSpeakComplete() {
+		methodChannel->InvokeMethod("speak.onComplete", NULL);
+		EnterCriticalSection(&cs);
+		if (speakResult) {
+			speakResult->Success(1);
+			speakResult.reset();
+		}
+		LeaveCriticalSection(&cs);
 	}
 	void FlutterTtsPlugin::pause()
 	{
@@ -373,10 +414,24 @@ namespace {
 	}
 	void FlutterTtsPlugin::stop()
 	{
+		// Cancel the pending completion wait first so its callback can't fire
+		// after we invalidate speakResult below (would be a use-after-free).
+		if (addWaitHandle != NULL) {
+			UnregisterWaitEx(addWaitHandle, INVALID_HANDLE_VALUE);
+			addWaitHandle = NULL;
+		}
 		pVoice->Speak(L"", 2, NULL);
 		pVoice->Resume();
 		isPaused = false;
 	    methodChannel->InvokeMethod("speak.onCancel", NULL);
+		// Resolve the awaited speak future (if any) so the Dart side isn't left
+		// waiting forever after a cancel.
+		EnterCriticalSection(&cs);
+		if (speakResult) {
+			speakResult->Success(1);
+			speakResult.reset();
+		}
+		LeaveCriticalSection(&cs);
 	}
 	void FlutterTtsPlugin::setVolume(const double newVolume)
 	{

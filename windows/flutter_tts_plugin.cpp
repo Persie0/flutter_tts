@@ -9,11 +9,74 @@
 #include <map>
 #include <memory>
 #include <sstream>
+#include <functional>
+#include <optional>
 
 typedef std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> FlutterResult;
 //typedef flutter::MethodResult<flutter::EncodableValue>* PFlutterResult;
 
 std::unique_ptr<flutter::MethodChannel<>> methodChannel;
+
+// MediaPlayer.MediaEnded and SAPI wait callbacks run on worker threads.
+// Flutter requires MethodChannel::InvokeMethod / MethodResult::Success on the
+// platform thread (see Flutter docs: channels-and-platform-threading).
+namespace flutter_tts_windows {
+constexpr UINT kPlatformTaskMsg = WM_APP + 0x5473;
+
+struct PlatformTask {
+	std::function<void()> run;
+};
+
+HWND g_flutter_hwnd = nullptr;
+
+std::optional<LRESULT> OnWindowProc(HWND /*hwnd*/, UINT message,
+	WPARAM /*wparam*/, LPARAM lparam) {
+	if (message != kPlatformTaskMsg) {
+		return std::nullopt;
+	}
+	auto* task = reinterpret_cast<PlatformTask*>(lparam);
+	if (task != nullptr) {
+		if (task->run) {
+			task->run();
+		}
+		delete task;
+	}
+	return 0;
+}
+
+void BindPlatformThread(flutter::PluginRegistrarWindows* registrar) {
+	if (registrar == nullptr) {
+		return;
+	}
+	if (registrar->GetView() != nullptr) {
+		g_flutter_hwnd = registrar->GetView()->GetNativeWindow();
+	}
+	registrar->RegisterTopLevelWindowProcDelegate(OnWindowProc);
+}
+
+void RunOnPlatformThread(std::function<void()> fn) {
+	if (!fn) {
+		return;
+	}
+	DWORD window_thread = 0;
+	if (g_flutter_hwnd != nullptr) {
+		window_thread = GetWindowThreadProcessId(g_flutter_hwnd, nullptr);
+	}
+	if (window_thread != 0 && GetCurrentThreadId() == window_thread) {
+		fn();
+		return;
+	}
+	if (g_flutter_hwnd == nullptr) {
+		// No HWND (unexpected). Do not invoke from a worker thread.
+		return;
+	}
+	auto* task = new PlatformTask{std::move(fn)};
+	if (!PostMessage(g_flutter_hwnd, kPlatformTaskMsg, 0,
+		reinterpret_cast<LPARAM>(task))) {
+		delete task;
+	}
+}
+}  // namespace flutter_tts_windows
 
 #if defined(WINAPI_FAMILY) && (WINAPI_FAMILY == WINAPI_FAMILY_DESKTOP_APP)
 #include <winrt/Windows.Media.SpeechSynthesis.h>
@@ -65,6 +128,7 @@ namespace {
 			std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
 				registrar->messenger(), "flutter_tts",
 				&flutter::StandardMethodCodec::GetInstance());
+		flutter_tts_windows::BindPlatformThread(registrar);
 		auto plugin = std::make_unique<FlutterTtsPlugin>();
 
 		methodChannel->SetMethodCallHandler(
@@ -80,11 +144,15 @@ namespace {
 			mPlayer.MediaEnded([=](Windows::Media::Playback::MediaPlayer const& sender,
 				Windows::Foundation::IInspectable const& args)
 				{
-				    methodChannel->InvokeMethod("speak.onComplete", NULL);
-				    if (awaitSpeakCompletion) {
-                        speakResult->Success(1);
-                    }
-					isSpeaking = false;
+					flutter_tts_windows::RunOnPlatformThread([this]() {
+						if (methodChannel) {
+							methodChannel->InvokeMethod("speak.onComplete", NULL);
+						}
+						if (awaitSpeakCompletion && speakResult) {
+							speakResult->Success(1);
+						}
+						isSpeaking = false;
+					});
 				});
 	}
 
@@ -284,6 +352,7 @@ namespace {
 			std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
 				registrar->messenger(), "flutter_tts",
 				&flutter::StandardMethodCodec::GetInstance());
+		flutter_tts_windows::BindPlatformThread(registrar);
 		auto plugin = std::make_unique<FlutterTtsPlugin>();
 		methodChannel->SetMethodCallHandler(
 			[plugin_pointer = plugin.get()](const auto& call, auto result) {
@@ -319,13 +388,22 @@ namespace {
 
     void CALLBACK setResult(PVOID lpParam, BOOLEAN TimerOrWaitFired)
     {
-        flutter::MethodResult<flutter::EncodableValue>* p = (flutter::MethodResult<flutter::EncodableValue>*) lpParam;
-        p->Success(1);
+        flutter_tts_windows::RunOnPlatformThread([lpParam]() {
+            flutter::MethodResult<flutter::EncodableValue>* p =
+                (flutter::MethodResult<flutter::EncodableValue>*) lpParam;
+            if (p != nullptr) {
+                p->Success(1);
+            }
+        });
     }
 
     void CALLBACK onCompletion(PVOID lpParam, BOOLEAN TimerOrWaitFired)
     {
-        methodChannel->InvokeMethod("speak.onComplete", NULL);
+        flutter_tts_windows::RunOnPlatformThread([]() {
+            if (methodChannel) {
+                methodChannel->InvokeMethod("speak.onComplete", NULL);
+            }
+        });
     }
 
 	bool FlutterTtsPlugin::speaking()

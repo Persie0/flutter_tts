@@ -1,5 +1,11 @@
 # ChangeLog
 
+## 4.2.6
+
+### Fixes
+
+- **Windows:** Marshal speak completion callbacks onto the Flutter platform thread (fixes #629)
+
 ## 4.2.5
 
 ### Fixes

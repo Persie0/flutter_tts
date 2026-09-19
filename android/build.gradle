@@ -34,7 +34,9 @@ apply plugin: 'com.android.library'
 // Kotlin, so only apply KGP for apps still on older AGP versions, per
 // https://docs.flutter.dev/release/breaking-changes/migrate-to-built-in-kotlin/for-plugin-authors
 def agpMajor = com.android.Version.ANDROID_GRADLE_PLUGIN_VERSION.tokenize('.')[0] as int
-if (agpMajor < 9) {
+def builtInKotlin = (findProperty("android.builtInKotlin") ?: "false").toString().toBoolean()
+def usesLegacyKgp = agpMajor < 9 || !builtInKotlin
+if (usesLegacyKgp) {
     apply plugin: 'kotlin-android'
 }
 
@@ -61,9 +63,11 @@ android {
 
 }
 
-kotlin {
-    compilerOptions {
-        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11
+if (usesLegacyKgp) {
+    kotlin {
+        compilerOptions {
+            jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11
+        }
     }
 }
 

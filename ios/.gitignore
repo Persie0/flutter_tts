@@ -29,3 +29,6 @@ xcuserdata
 Icon?
 .tags*
 
+# Swift Package Manager
+.build/
+.swiftpm/

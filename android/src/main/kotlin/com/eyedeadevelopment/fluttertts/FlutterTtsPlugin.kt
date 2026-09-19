@@ -425,6 +425,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
 
             "getLanguages" -> getLanguages(result)
             "getVoices" -> getVoices(result)
+            "getCurrentVoice" -> getCurrentVoice(result)
             "getSpeechRateValidRange" -> getSpeechRateValidRange(result)
             "getEngines" -> getEngines(result)
             "getDefaultEngine" -> getDefaultEngine(result)
@@ -574,6 +575,23 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
             result.success(voices)
         } catch (e: NullPointerException) {
             Log.d(tag, "getVoices: " + e.message)
+            result.success(null)
+        }
+    }
+
+    private fun getCurrentVoice(result: Result) {
+        try {
+            val voice = tts!!.voice
+            if (voice != null) {
+                val currentVoice = HashMap<String, String>()
+                readVoiceProperties(currentVoice, voice)
+                result.success(currentVoice)
+            } else {
+                Log.d(tag, "Voice is not set")
+                result.success(null)
+            }
+        } catch (e: NullPointerException) {
+            Log.d(tag, "getCurrentVoice: " + e.message)
             result.success(null)
         }
     }

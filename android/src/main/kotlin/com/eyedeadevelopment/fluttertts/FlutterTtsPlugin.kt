@@ -31,7 +31,6 @@ import java.util.MissingResourceException
 import java.util.UUID
 
 
-/** FlutterTtsPlugin  */
 /**
  * Teardown may call a vendor TTS engine through a blocking Binder transaction.
  * Never invoke it on Flutter's platform thread during engine detach.
@@ -53,6 +52,7 @@ internal fun shutdownTtsInBackground(engine: TextToSpeech?) {
     }, "FlutterTtsShutdown").apply { isDaemon = true }.start()
 }
 
+/** FlutterTtsPlugin */
 class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     private var handler: Handler? = null
     private var methodChannel: MethodChannel? = null

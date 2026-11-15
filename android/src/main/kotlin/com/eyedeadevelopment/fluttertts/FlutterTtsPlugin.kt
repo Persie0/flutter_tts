@@ -31,7 +31,28 @@ import java.util.MissingResourceException
 import java.util.UUID
 
 
-/** FlutterTtsPlugin  */
+/**
+ * Teardown may call a vendor TTS engine through a blocking Binder transaction.
+ * Never invoke it on Flutter's platform thread during engine detach.
+ */
+internal fun shutdownTtsInBackground(engine: TextToSpeech?) {
+    if (engine == null) return
+    Thread({
+        try {
+            engine.stop()
+        } catch (error: Exception) {
+            Log.w("TTS", "TextToSpeech.stop() failed during detach", error)
+        } finally {
+            try {
+                engine.shutdown()
+            } catch (error: Exception) {
+                Log.w("TTS", "TextToSpeech.shutdown() failed during detach", error)
+            }
+        }
+    }, "FlutterTtsShutdown").apply { isDaemon = true }.start()
+}
+
+/** FlutterTtsPlugin */
 class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     private var handler: Handler? = null
     private var methodChannel: MethodChannel? = null
@@ -80,11 +101,19 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        stop()
-        tts!!.shutdown()
-        context = null
-        methodChannel!!.setMethodCallHandler(null)
+        // Android TTS IPC may block for seconds inside stop()/shutdown().
+        // Flutter's engine detaches on the platform/UI thread: never wait there
+        // for a slow or hung OEM speech service (Hanzi GlitchTip #127).
+        methodChannel?.setMethodCallHandler(null)
         methodChannel = null
+        synchronized(this) {
+            pendingMethodCalls.clear()
+            ttsStatus = TextToSpeech.ERROR
+        }
+        val engineToClose = tts
+        tts = null
+        context = null
+        shutdownTtsInBackground(engineToClose)
     }
 
     private val utteranceProgressListener: UtteranceProgressListener =
@@ -227,7 +256,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
             }
 
             if (status == TextToSpeech.SUCCESS) {
-                tts!!.setOnUtteranceProgressListener(utteranceProgressListener)
+                tts?.setOnUtteranceProgressListener(utteranceProgressListener)
 
                 // FIX 2: Only reply once per request to avoid "Reply already submitted" crash.
                 if (engineResult != null) {
@@ -257,7 +286,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
             }
 
             if (status == TextToSpeech.SUCCESS) {
-                tts!!.setOnUtteranceProgressListener(utteranceProgressListener)
+                tts?.setOnUtteranceProgressListener(utteranceProgressListener)
             } else {
                 Log.e(tag, "Failed to initialize TextToSpeech with status: $status")
             }
